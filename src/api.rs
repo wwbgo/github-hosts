@@ -292,22 +292,41 @@ async fn livez() -> Response {
 async fn healthz(State(st): State<Arc<AppState>>) -> Response {
     match authoritative(&st).await {
         Some((s, _)) => {
-            let code = if s.required_ok && s.git_ok {
+            // Freshness is part of the data quality this endpoint reports: a
+            // snapshot no cycle can replace would otherwise keep answering 200
+            // with yesterday's numbers, which is the failure mode the publishing
+            // policy exists for.
+            let healthy = s.required_ok && s.git_ok;
+            let stale = page::is_stale(&s, st.cfg.interval.as_secs(), chrono::Local::now());
+            let code = if healthy && !stale {
                 StatusCode::OK
             } else {
                 StatusCode::SERVICE_UNAVAILABLE
             };
+            let status = if !healthy {
+                "degraded"
+            } else if stale {
+                "stale"
+            } else {
+                "ok"
+            };
             let save_error = st.last_save_error.read().await.clone();
+            let failures = st.failure_streaks().await;
             (
                 code,
                 Json(serde_json::json!({
-                    "status": if code == StatusCode::OK { "ok" } else { "degraded" },
+                    "status": status,
+                    "stale": stale,
                     "cycle": s.cycle_id,
                     "generated_at": s.generated_at.to_rfc3339(),
+                    "age_secs": (chrono::Local::now() - s.generated_at).num_seconds(),
                     "verified": s.verified,
+                    "expected": s.expected,
                     "required_ok": s.required_ok,
                     "git_ok": s.git_ok,
                     "elapsed_ms": s.elapsed_ms,
+                    "unverified": s.unverified,
+                    "unverified_cycles": failures,
                     "interval_secs": st.cfg.interval.as_secs(),
                     "state_dir": st.cfg.state_dir.display().to_string(),
                     "persisted": save_error.is_none(),
@@ -329,6 +348,7 @@ async fn index(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response 
     let probing = st.is_probing();
     let next = *st.next_probe_at.read().await;
     let interval = st.cfg.interval.as_secs();
+    let failures = st.failure_streaks().await;
     let mode = st.cfg.mode.clone();
     let state_desc = st.store.describe();
     let save_error = st.last_save_error.read().await.clone();
@@ -347,15 +367,16 @@ async fn index(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response 
                 (header::CONTENT_TYPE, "text/html; charset=utf-8"),
                 (header::CACHE_CONTROL, "no-store"),
             ],
-            page::status_html(
-                snap.as_ref(),
+            page::status_html(page::Status {
+                snap: snap.as_ref(),
                 probing,
+                failures: &failures,
                 next,
-                interval,
-                &mode,
-                &state_desc,
-                save_error.as_deref(),
-            ),
+                interval_secs: interval,
+                mode: &mode,
+                state_desc: &state_desc,
+                save_error: save_error.as_deref(),
+            }),
         )
             .into_response()
     } else {
@@ -365,15 +386,16 @@ async fn index(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response 
                 (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
                 (header::CACHE_CONTROL, "no-store"),
             ],
-            page::status_text(
-                snap.as_ref(),
+            page::status_text(page::Status {
+                snap: snap.as_ref(),
                 probing,
+                failures: &failures,
                 next,
-                interval,
-                &mode,
-                &state_desc,
-                save_error.as_deref(),
-            ),
+                interval_secs: interval,
+                mode: &mode,
+                state_desc: &state_desc,
+                save_error: save_error.as_deref(),
+            }),
         )
             .into_response()
     }

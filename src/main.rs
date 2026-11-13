@@ -38,20 +38,16 @@ async fn main() -> Result<()> {
         let cycle_id = prev.map(|s| s.cycle_id + 1).unwrap_or(1);
         let snap = probe::run_cycle(&cfg, cycle_id, prev).await;
 
-        // Warn before clobbering a better result: running --once during a bad
-        // window while the daemon holds a good snapshot would otherwise publish
-        // the worse one to disk. The write still happens -- --once is an
-        // explicit request -- but never silently.
+        // An explicit --once writes regardless of how this cycle compares: it is
+        // a request to record what was just measured. Say what got lost, so a
+        // shutdown of a host is visible without diffing the file.
         if let Some(old) = prev {
-            if !probe::is_at_least_as_good(old, &snap) {
+            let lost = probe::lost_hosts(old, &snap);
+            if !lost.is_empty() {
                 tracing::warn!(
-                    "this cycle is worse than the stored one ({} required / {} total, vs {} / {}); \
-                     overwriting {} anyway because --once was requested",
-                    snap.required_hits(),
-                    snap.verified,
-                    old.required_hits(),
-                    old.verified,
-                    store.hosts_path().display()
+                    "this cycle lost {} host(s) the stored snapshot had: {}",
+                    lost.len(),
+                    lost.join(", ")
                 );
             }
         }
@@ -112,11 +108,18 @@ async fn main() -> Result<()> {
                     snap.elapsed_ms
                 );
 
+                // Count the failures before the nothing-verified guard: a
+                // cycle where the whole network is gone must still raise the
+                // per-host streaks, otherwise the one case where "it has been
+                // failing for an hour" matters most is the one that stays
+                // invisible.
+                state.note_cycle(&snap).await;
+
                 // Do not publish a cycle that verified nothing: with FAMILIES=""
                 // or all names misspelled, `jobs` is empty, which used to produce
                 // verified=0/expected=0/required_ok=true and satisfy the
                 // cold-start condition, publishing a header-only block.
-                if snap.verified == 0 {
+                if !probe::publishable(&snap) {
                     tracing::error!(
                         "cycle {cycle_id} verified nothing (check FAMILIES={:?}); not publishing",
                         std::env::var("FAMILIES").unwrap_or_default()
@@ -133,19 +136,30 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                let publish = match prev_snap.as_ref() {
-                    None => snap.required_ok || snap.verified > 0,
-                    Some(old) => probe::is_at_least_as_good(old, &snap),
-                };
-                if publish {
-                    let block = render_hosts(&snap, &state.cfg.mode);
-                    state.publish(snap, block).await;
-                    tracing::info!("snapshot published to {}", state.store.describe());
-                } else {
-                    // The committed files keep the previous good result, which
-                    // is the whole point of not overwriting on a worse cycle.
-                    tracing::warn!("cycle worse than current snapshot; keeping previous");
+                // The newest cycle always replaces the previous one. The old
+                // rule -- publish only when the new cycle ranked at least as
+                // high -- froze the file as soon as an optional host stopped
+                // verifying: the pin for that host stayed on disk long after a
+                // cycle had proved it dead, and every other host's freshly
+                // verified address was thrown away with it. A stale answer is
+                // worse than a smaller honest one.
+                if let Some(old) = prev_snap.as_ref() {
+                    let lost = probe::lost_hosts(old, &snap);
+                    if !lost.is_empty() {
+                        tracing::warn!(
+                            "cycle {cycle_id} lost {} host(s) the previous cycle had: {}",
+                            lost.len(),
+                            lost.join(", ")
+                        );
+                    }
                 }
+                let required = snap.required_hits();
+                let block = render_hosts(&snap, &state.cfg.mode);
+                state.publish(snap, block).await;
+                tracing::info!(
+                    "snapshot published ({required} required host(s)): {}",
+                    state.store.describe()
+                );
 
                 state.set_probing(false);
                 // Jitter so a fleet of instances does not synchronise its

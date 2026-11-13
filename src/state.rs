@@ -14,6 +14,7 @@ use crate::config::Config;
 use crate::probe::Snapshot;
 use crate::store::Store;
 use chrono::{DateTime, Local};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Notify, RwLock};
@@ -30,8 +31,12 @@ pub struct Published {
 pub struct AppState {
     pub cfg: Config,
     pub store: Store,
-    /// Newest good cycle. Replaced only when the new one ranks at least as high.
+    /// Newest published cycle, always the last one that completed.
     pub current: RwLock<Option<Arc<Published>>>,
+    /// Consecutive cycles each host has failed to verify. Nothing stale is kept
+    /// for a host that failed, so this counter is the only place where "it has
+    /// been failing for an hour" stays visible.
+    pub failures: RwLock<BTreeMap<String, u32>>,
     /// Wakes the scheduler early (POST /v1/refresh).
     pub refresh: Notify,
     pub cycle: AtomicU64,
@@ -53,6 +58,7 @@ impl AppState {
             cfg,
             store,
             current: RwLock::new(None),
+            failures: RwLock::new(BTreeMap::new()),
             refresh: Notify::new(),
             cycle: AtomicU64::new(0),
             next_probe_at: RwLock::new(None),
@@ -64,6 +70,29 @@ impl AppState {
 
     pub async fn published(&self) -> Option<Arc<Published>> {
         self.current.read().await.clone()
+    }
+
+    /// Record which hosts this cycle failed to verify, so a persistent failure
+    /// can be told apart from a single bad window.
+    pub async fn note_cycle(&self, snap: &Snapshot) {
+        // A host whose family is turned off was never probed. Counting it would
+        // report a configuration choice as an outage, so it is skipped and any
+        // streak it had is dropped.
+        let failing: BTreeSet<&str> = snap
+            .unverified
+            .iter()
+            .map(|h| h.as_str())
+            .filter(|h| !snap.suppressed.iter().any(|s| s == h))
+            .collect();
+        let mut f = self.failures.write().await;
+        f.retain(|host, _| failing.contains(host.as_str()));
+        for host in failing {
+            *f.entry(host.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    pub async fn failure_streaks(&self) -> BTreeMap<String, u32> {
+        self.failures.read().await.clone()
     }
 
     pub fn next_cycle_id(&self) -> u64 {
@@ -79,6 +108,10 @@ impl AppState {
     }
 
     /// Install a new cycle and mirror it to disk.
+    ///
+    /// Every completed cycle is installed: the newest probe result is the truth,
+    /// and keeping an older snapshot would leave pins on disk for hosts this
+    /// cycle just failed to reach.
     ///
     /// The in-memory record is installed regardless of the write result, because
     /// it is the newer truth; `persisted` records whether the disk agrees.
@@ -129,5 +162,46 @@ impl AppState {
             persisted: true,
         }));
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::probe::test_snapshot;
+
+    #[tokio::test]
+    async fn failure_streaks_accumulate_and_reset() {
+        let st = AppState::new(Config::default());
+        for _ in 0..3 {
+            st.note_cycle(&test_snapshot(&["github.com"], &["gist.github.com"], true))
+                .await;
+        }
+        assert_eq!(st.failure_streaks().await.get("gist.github.com"), Some(&3));
+
+        st.note_cycle(&test_snapshot(
+            &["github.com", "gist.github.com"],
+            &[],
+            true,
+        ))
+        .await;
+        assert!(
+            st.failure_streaks().await.is_empty(),
+            "a host that verified again must lose its streak"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_family_turned_off_is_not_a_failure_streak() {
+        // FAMILIES=api is a valid configuration; the hosts it excludes were
+        // never probed, so they must not appear as "failing for N cycles".
+        let st = AppState::new(Config::default());
+        let mut snap = test_snapshot(&["api.github.com"], &["github.com"], true);
+        snap.suppressed = vec!["github.com".to_string()];
+        st.note_cycle(&snap).await;
+        assert!(
+            st.failure_streaks().await.is_empty(),
+            "a suppressed host is not a failure"
+        );
     }
 }

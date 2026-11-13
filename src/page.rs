@@ -8,6 +8,7 @@
 use crate::probe::Snapshot;
 use crate::render::VERSION;
 use chrono::{DateTime, Local};
+use std::collections::BTreeMap;
 
 fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -24,22 +25,40 @@ fn esc(s: &str) -> String {
     out
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Health {
     Starting,
     Busy,
     Ok,
     Degraded,
     Down,
+    /// Verified, git fine, but nothing has been published for several intervals.
+    Stale,
+}
+
+/// Intervals without a new publish before the block is called stale.
+const STALE_INTERVALS: i64 = 3;
+
+/// A snapshot that has not been refreshed for several intervals is no longer a
+/// live answer, whatever its numbers say. Shared by the status page and
+/// `/healthz` so the two cannot disagree about freshness.
+pub fn is_stale(snap: &Snapshot, interval_secs: u64, now: DateTime<Local>) -> bool {
+    interval_secs > 0
+        && (now - snap.generated_at).num_seconds() > STALE_INTERVALS * interval_secs as i64
 }
 
 impl Health {
-    fn of(snap: Option<&Snapshot>, probing: bool) -> Self {
+    fn of(snap: Option<&Snapshot>, probing: bool, interval_secs: u64) -> Self {
         match snap {
             None if probing => Health::Busy,
             None => Health::Starting,
             Some(s) => {
-                if s.required_ok && s.git_ok {
+                // A cycle that never publishes (blocked network, disabled
+                // families) leaves the numbers looking healthy while the block
+                // on disk keeps answering with stale addresses.
+                if is_stale(s, interval_secs, Local::now()) {
+                    Health::Stale
+                } else if s.required_ok && s.git_ok {
                     Health::Ok
                 } else if s.verified > 0 {
                     Health::Degraded
@@ -57,6 +76,7 @@ impl Health {
             Health::Degraded => "warn",
             Health::Starting => "warn",
             Health::Down => "bad",
+            Health::Stale => "warn",
         }
     }
 
@@ -67,7 +87,16 @@ impl Health {
             Health::Degraded => "部分可用",
             Health::Starting => "启动中",
             Health::Down => "不可用",
+            Health::Stale => "数据陈旧",
         }
+    }
+}
+
+/// `host (连续 N 轮)` once a failure has outlived a single cycle.
+fn with_streak(host: &str, failures: &BTreeMap<String, u32>) -> String {
+    match failures.get(host) {
+        Some(n) if *n > 1 => format!("{host} (连续 {n} 轮)"),
+        _ => host.to_string(),
     }
 }
 
@@ -82,17 +111,34 @@ fn human_ago(t: DateTime<Local>) -> String {
     }
 }
 
+/// Everything the status views need. Eight live arguments was past the point
+/// where a positional call site is readable, and it keeps the two renderers in
+/// step.
+#[derive(Clone, Copy)]
+pub struct Status<'a> {
+    pub snap: Option<&'a Snapshot>,
+    pub probing: bool,
+    pub failures: &'a BTreeMap<String, u32>,
+    pub next: Option<DateTime<Local>>,
+    pub interval_secs: u64,
+    pub mode: &'a str,
+    pub state_desc: &'a str,
+    pub save_error: Option<&'a str>,
+}
+
 /// Plain-text status, for `curl /` and anything that does not speak HTML.
-pub fn status_text(
-    snap: Option<&Snapshot>,
-    probing: bool,
-    next: Option<DateTime<Local>>,
-    interval_secs: u64,
-    mode: &str,
-    state_desc: &str,
-    save_error: Option<&str>,
-) -> String {
-    let health = Health::of(snap, probing);
+pub fn status_text(st: Status<'_>) -> String {
+    let Status {
+        snap,
+        probing,
+        failures,
+        next,
+        interval_secs,
+        mode,
+        state_desc,
+        save_error,
+    } = st;
+    let health = Health::of(snap, probing, interval_secs);
     let mut s = String::new();
     s.push_str(&format!("github-hosts {VERSION}\n\n"));
     s.push_str(&format!("status   {}\n", health.label()));
@@ -112,7 +158,12 @@ pub fn status_text(
                 human_ago(p.generated_at)
             ));
             if !p.unverified.is_empty() {
-                s.push_str(&format!("unverified {}\n", p.unverified.join(", ")));
+                let list: Vec<String> = p
+                    .unverified
+                    .iter()
+                    .map(|h| with_streak(h, failures))
+                    .collect();
+                s.push_str(&format!("unverified {}\n", list.join(", ")));
             }
             for e in &p.endpoints {
                 s.push_str(&format!(
@@ -145,16 +196,18 @@ pub fn status_text(
     s
 }
 
-pub fn status_html(
-    snap: Option<&Snapshot>,
-    probing: bool,
-    next: Option<DateTime<Local>>,
-    interval_secs: u64,
-    mode: &str,
-    state_desc: &str,
-    save_error: Option<&str>,
-) -> String {
-    let health = Health::of(snap, probing);
+pub fn status_html(st: Status<'_>) -> String {
+    let Status {
+        snap,
+        probing,
+        failures,
+        next,
+        interval_secs,
+        mode,
+        state_desc,
+        save_error,
+    } = st;
+    let health = Health::of(snap, probing, interval_secs);
     let mut h = String::with_capacity(8192);
 
     h.push_str("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">");
@@ -319,11 +372,19 @@ color:var(--warn);font-size:12.5px;font-family:var(--mono);word-break:break-word
             ));
         }
         for host in &p.unverified {
+            // The streak goes in the numeric column: it is a count, while the IP
+            // column is reserved for an address this host does not have.
+            let (text, title) = match failures.get(host) {
+                Some(n) if *n > 1 => (format!("{n} 轮"), format!("已连续 {n} 轮未验证")),
+                _ => ("—".to_string(), "未验证".to_string()),
+            };
             h.push_str(&format!(
                 "<div class=\"row miss\"><span class=\"host\"><span class=\"dot\" \
                  title=\"未验证\"></span>{}</span>\
-                 <span class=\"ip\">—</span><span class=\"ms\">—</span></div>",
-                esc(host)
+                 <span class=\"ip\">—</span><span class=\"ms\" title=\"{}\">{}</span></div>",
+                esc(host),
+                esc(&title),
+                esc(&text)
             ));
         }
         h.push_str("</div>");
@@ -337,6 +398,14 @@ color:var(--warn);font-size:12.5px;font-family:var(--mono);word-break:break-word
             h.push_str(&format!(
                 "<p class=\"warnline\">git: {}</p>",
                 esc(&p.git_detail)
+            ));
+        }
+        // One badge slot cannot show "stale" and "degraded" at once, so the age
+        // is repeated here rather than being hidden behind the badge label.
+        if is_stale(p, interval_secs, Local::now()) {
+            h.push_str(&format!(
+                "<p class=\"warnline\">上次成功检测在{}（超过 {STALE_INTERVALS} 个检测周期）：块里的 IP 来自那一轮，不会自动刷新。</p>",
+                human_ago(p.generated_at)
             ));
         }
     }
@@ -360,4 +429,94 @@ color:var(--warn);font-size:12.5px;font-family:var(--mono);word-break:break-word
 
     h.push_str("</main></body></html>");
     h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::probe::test_snapshot;
+
+    const INTERVAL: u64 = 900;
+
+    fn view<'a>(s: &'a Snapshot, failures: &'a BTreeMap<String, u32>) -> Status<'a> {
+        Status {
+            snap: Some(s),
+            probing: false,
+            failures,
+            next: None,
+            interval_secs: INTERVAL,
+            mode: "pin",
+            state_desc: "data",
+            save_error: None,
+        }
+    }
+
+    fn at(offset_secs: i64) -> Snapshot {
+        let mut s = test_snapshot(&["github.com"], &[], true);
+        s.generated_at = Local::now() + chrono::Duration::seconds(offset_secs);
+        s
+    }
+
+    #[test]
+    fn a_fresh_snapshot_is_ok() {
+        let s = test_snapshot(&["github.com"], &[], true);
+        assert_eq!(Health::of(Some(&s), false, INTERVAL), Health::Ok);
+    }
+
+    #[test]
+    fn a_snapshot_older_than_three_intervals_is_stale() {
+        // Nothing published for 50 minutes while the interval is 15: whatever
+        // the numbers say, the block on disk is no longer a live answer.
+        let mut s = test_snapshot(&["github.com"], &[], true);
+        s.generated_at = Local::now() - chrono::Duration::minutes(50);
+        assert_eq!(Health::of(Some(&s), false, INTERVAL), Health::Stale);
+    }
+
+    #[test]
+    fn staleness_needs_three_missed_intervals() {
+        assert!(!is_stale(&at(0), INTERVAL, Local::now()));
+        assert!(!is_stale(&at(-2 * 900), INTERVAL, Local::now()));
+        assert!(is_stale(&at(-3 * 900 - 60), INTERVAL, Local::now()));
+    }
+
+    #[test]
+    fn a_clock_that_jumps_backwards_is_not_stale() {
+        assert!(!is_stale(&at(3600), INTERVAL, Local::now()));
+    }
+
+    #[test]
+    fn a_persistent_failure_is_shown_with_its_streak() {
+        let snap = test_snapshot(&["github.com"], &["gist.github.com"], true);
+        let mut failures = BTreeMap::new();
+        failures.insert("gist.github.com".to_string(), 5);
+        let text = status_text(view(&snap, &failures));
+        assert!(
+            text.contains("gist.github.com (连续 5 轮)"),
+            "a host that keeps failing must say so, got:
+{text}"
+        );
+        let html = status_html(view(&snap, &failures));
+        assert!(html.contains("连续 5 轮"));
+    }
+
+    #[test]
+    fn a_single_miss_does_not_look_like_a_trend() {
+        let snap = test_snapshot(&["github.com"], &["gist.github.com"], true);
+        let mut failures = BTreeMap::new();
+        failures.insert("gist.github.com".to_string(), 1);
+        let text = status_text(view(&snap, &failures));
+        assert!(!text.contains("连续"), "one bad cycle is not a streak");
+    }
+
+    #[test]
+    fn a_stale_snapshot_explains_itself_on_the_page() {
+        let snap = at(-3 * 900 - 60);
+        let failures = BTreeMap::new();
+        let html = status_html(view(&snap, &failures));
+        assert!(
+            html.contains("上次成功检测在"),
+            "the page must say the copy is stale"
+        );
+        assert!(html.contains("不会自动刷新"));
+    }
 }

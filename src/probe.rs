@@ -17,7 +17,7 @@ use crate::validators::*;
 use chrono::{DateTime, Local};
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Instant;
 
@@ -294,6 +294,11 @@ pub struct Snapshot {
     pub elapsed_ms: u64,
     pub endpoints: Vec<Endpoint>,
     pub unverified: Vec<String>,
+    /// Subset of `unverified` that was never probed because `FAMILIES` turned
+    /// its family off. Kept separate so a configuration choice is not reported as
+    /// a host that keeps failing.
+    #[serde(default)]
+    pub suppressed: Vec<String>,
     /// What the system resolver returned for each hostname during this cycle.
     /// Exposed so `mode=auto` can skip pinning what DNS already gets right, and
     /// so operators can see DNS poisoning at a glance.
@@ -728,12 +733,14 @@ pub async fn run_cycle(cfg: &Config, cycle_id: u64, prev: Option<&Snapshot>) -> 
     // ---- assemble ----
     let mut endpoints = Vec::new();
     let mut unverified = Vec::new();
+    let mut suppressed_hosts: Vec<String> = Vec::new();
     let mut required_ok = true;
     for (host, required) in &suppressed {
         if *required {
             required_ok = false;
         }
         unverified.push(host.to_string());
+        suppressed_hosts.push(host.to_string());
         tracing::warn!("{host} not probed: family disabled by FAMILIES");
     }
     for (host, ep, required) in outcomes {
@@ -809,53 +816,75 @@ pub async fn run_cycle(cfg: &Config, cycle_id: u64, prev: Option<&Snapshot>) -> 
         elapsed_ms: t0.elapsed().as_millis() as u64,
         endpoints,
         unverified,
+        suppressed: suppressed_hosts,
         dns: dns_map,
     }
 }
 
-/// Publish order. Coverage of *required* hosts outranks total coverage: a
-/// cycle that verifies 12 optional hosts but loses `github.com` is worse than
-/// one that verifies 6, and a plain endpoint count cannot tell them apart.
-/// git is the last tiebreak because a block without a working `git` cannot be
-/// fetched from at all.
-fn rank(s: &Snapshot) -> (usize, usize, bool) {
-    (s.required_hits(), s.endpoints.len(), s.git_ok)
+/// Hosts that the previous snapshot had verified and this cycle does not.
+///
+/// Publication does not depend on this: the newest cycle always replaces the
+/// previous one, because a pin kept for a host that just failed is stale data
+/// presented as a verified answer. This list exists so a host that drops out is
+/// reported instead of disappearing silently. Hosts skipped by `FAMILIES` are
+/// excluded -- turning a family off is not a host going down.
+pub fn lost_hosts(old: &Snapshot, new: &Snapshot) -> Vec<String> {
+    let now: BTreeSet<&str> = new
+        .endpoints
+        .iter()
+        .filter(|e| e.verified)
+        .map(|e| e.host.as_str())
+        .collect();
+    let skipped: BTreeSet<&str> = new.suppressed.iter().map(|s| s.as_str()).collect();
+    old.endpoints
+        .iter()
+        .filter(|e| e.verified)
+        .filter(|e| !now.contains(e.host.as_str()) && !skipped.contains(e.host.as_str()))
+        .map(|e| e.host.clone())
+        .collect()
 }
 
-/// Guard against replacing a good snapshot with a degraded one.
-pub fn is_at_least_as_good(old: &Snapshot, new: &Snapshot) -> bool {
-    rank(new) >= rank(old)
+/// Whether a cycle may replace what is on disk.
+///
+/// The only veto left: a cycle that verified nothing (`FAMILIES=""` or every
+/// name misspelled) would render a header-only block. Anything else is published
+/// as measured -- keeping an older block would serve pins the probe just failed.
+pub fn publishable(snap: &Snapshot) -> bool {
+    snap.verified > 0
+}
+
+/// Snapshot builder shared by the tests in this crate. Never compiled into a
+/// release binary.
+#[cfg(test)]
+pub fn test_snapshot(hits: &[&str], unverified: &[&str], git: bool) -> Snapshot {
+    Snapshot {
+        generated_at: Local::now(),
+        cycle_id: 1,
+        verified: hits.len(),
+        expected: hits.len() + unverified.len(),
+        required_ok: !unverified.iter().any(|h| host_is_required(h)),
+        git_ok: git,
+        git_detail: String::new(),
+        elapsed_ms: 0,
+        endpoints: hits
+            .iter()
+            .map(|h| Endpoint {
+                host: (*h).to_string(),
+                ip: "1.1.1.1".into(),
+                latency_ms: 1.0,
+                verified: true,
+                detail: String::new(),
+            })
+            .collect(),
+        unverified: unverified.iter().map(|h| (*h).to_string()).collect(),
+        suppressed: Vec::new(),
+        dns: BTreeMap::new(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Local;
-
-    fn snap(hits: &[(&str, bool)], git: bool) -> Snapshot {
-        Snapshot {
-            generated_at: Local::now(),
-            cycle_id: 1,
-            verified: hits.len(),
-            expected: hits.len(),
-            required_ok: true,
-            git_ok: git,
-            git_detail: String::new(),
-            elapsed_ms: 0,
-            endpoints: hits
-                .iter()
-                .map(|(h, _)| Endpoint {
-                    host: (*h).to_string(),
-                    ip: "1.1.1.1".into(),
-                    latency_ms: 1.0,
-                    verified: true,
-                    detail: String::new(),
-                })
-                .collect(),
-            unverified: Vec::new(),
-            dns: BTreeMap::new(),
-        }
-    }
 
     #[test]
     fn required_hosts_are_identified_from_targets() {
@@ -867,46 +896,58 @@ mod tests {
     }
 
     #[test]
-    fn losing_a_required_host_is_worse_than_gaining_optional_ones() {
-        // The regression this guards: 13 -> 33 verified but no github.com used
-        // to be accepted because only the raw count was compared.
-        let good = snap(&[("github.com", true), ("api.github.com", true)], true);
-        let wider = snap(
+    fn a_host_that_dropped_out_is_reported() {
+        let good = test_snapshot(&["github.com", "api.github.com"], &[], true);
+        let wider = test_snapshot(
             &[
-                ("api.github.com", true),
-                ("avatars.githubusercontent.com", true),
-                ("camo.githubusercontent.com", true),
-                ("media.githubusercontent.com", true),
+                "api.github.com",
+                "avatars.githubusercontent.com",
+                "camo.githubusercontent.com",
             ],
+            &["github.com"],
             true,
         );
+        assert_eq!(lost_hosts(&good, &wider), vec!["github.com".to_string()]);
+    }
+
+    #[test]
+    fn gaining_hosts_loses_nothing() {
+        let few = test_snapshot(&["github.com"], &[], true);
+        let more = test_snapshot(&["github.com", "api.github.com"], &[], true);
+        assert!(lost_hosts(&few, &more).is_empty());
+        assert_eq!(lost_hosts(&more, &few), vec!["api.github.com".to_string()]);
+    }
+
+    #[test]
+    fn identical_cycles_lose_nothing() {
+        let a = test_snapshot(&["github.com"], &[], true);
+        let b = test_snapshot(&["github.com"], &[], true);
+        assert!(lost_hosts(&a, &b).is_empty());
+    }
+
+    #[test]
+    fn a_host_skipped_by_config_is_not_reported_as_lost() {
+        // Narrowing FAMILIES is a configuration choice, not a host that died.
+        let old = test_snapshot(&["github.com", "api.github.com"], &[], true);
+        let mut narrowed = test_snapshot(&["api.github.com"], &[], true);
+        narrowed.suppressed = vec!["github.com".to_string()];
         assert!(
-            !is_at_least_as_good(&good, &wider),
-            "a block without github.com must not replace one that has it"
+            lost_hosts(&old, &narrowed).is_empty(),
+            "a family turned off by FAMILIES must not look like a loss"
         );
     }
 
     #[test]
-    fn more_required_coverage_is_accepted() {
-        let few = snap(&[("github.com", true)], true);
-        let more = snap(&[("github.com", true), ("api.github.com", true)], true);
-        assert!(is_at_least_as_good(&few, &more));
-        assert!(!is_at_least_as_good(&more, &few));
+    fn a_cycle_that_verified_nothing_must_not_replace_the_block() {
+        let empty = test_snapshot(&[], &["github.com", "api.github.com"], false);
+        assert!(!publishable(&empty));
     }
 
     #[test]
-    fn equal_coverage_prefers_a_git_working_result() {
-        let git_broken = snap(&[("github.com", true)], false);
-        let git_ok = snap(&[("github.com", true)], true);
-        assert!(is_at_least_as_good(&git_broken, &git_ok));
-        assert!(!is_at_least_as_good(&git_ok, &git_broken));
-    }
-
-    #[test]
-    fn identical_cycles_are_idempotent() {
-        let a = snap(&[("github.com", true)], true);
-        let b = snap(&[("github.com", true)], true);
-        assert!(is_at_least_as_good(&a, &b));
-        assert!(is_at_least_as_good(&b, &a));
+    fn a_cycle_missing_every_required_host_is_still_published() {
+        // The trade this project makes: fresh and incomplete beats old and
+        // complete, because an entry the probe just failed is not a working pin.
+        let optional_only = test_snapshot(&["camo.githubusercontent.com"], &["github.com"], false);
+        assert!(publishable(&optional_only));
     }
 }

@@ -278,6 +278,7 @@ mod tests {
                 detail: "site html=html 5000B".into(),
             }],
             unverified: vec!["gist.github.com".into()],
+            suppressed: Vec::new(),
             dns: BTreeMap::new(),
         }
     }

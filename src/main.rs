@@ -34,14 +34,15 @@ async fn main() -> Result<()> {
     if args.iter().any(|a| a == "--once") {
         let store = store::Store::new(&cfg.state_dir);
         let existing = store.load_optional();
-        let cycle_id = existing.as_ref().map(|s| s.cycle_id + 1).unwrap_or(1);
-        let snap = probe::run_cycle(&cfg, cycle_id, existing.as_ref()).await;
+        let prev = existing.as_ref().map(|(s, _, _)| s);
+        let cycle_id = prev.map(|s| s.cycle_id + 1).unwrap_or(1);
+        let snap = probe::run_cycle(&cfg, cycle_id, prev).await;
 
         // Warn before clobbering a better result: running --once during a bad
         // window while the daemon holds a good snapshot would otherwise publish
         // the worse one to disk. The write still happens -- --once is an
         // explicit request -- but never silently.
-        if let Some(old) = &existing {
+        if let Some(old) = prev {
             if !probe::is_at_least_as_good(old, &snap) {
                 tracing::warn!(
                     "this cycle is worse than the stored one ({} required / {} total, vs {} / {}); \
@@ -56,7 +57,7 @@ async fn main() -> Result<()> {
         }
 
         let block = render_hosts(&snap, &cfg.mode);
-        match store.save(&block, &snap) {
+        match store.save(&block, &snap, &cfg.mode) {
             Ok(()) => tracing::info!("state written to {}", store.describe()),
             Err(e) => tracing::error!("could not persist state: {e:#}"),
         }
@@ -99,8 +100,9 @@ async fn main() -> Result<()> {
 
                 // Snapshot the previous result first so the new cycle can prefer
                 // the addresses already in use.
-                let prev = state.current.read().await.clone();
-                let snap = probe::run_cycle(&state.cfg, cycle_id, prev.as_deref()).await;
+                let prev = state.published().await;
+                let prev_snap = prev.as_ref().map(|p| p.snapshot.clone());
+                let snap = probe::run_cycle(&state.cfg, cycle_id, prev_snap.as_ref()).await;
                 tracing::info!(
                     "probe cycle {} done: {}/{} verified, git={}, {}ms",
                     cycle_id,
@@ -131,16 +133,16 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                let publish = match prev.as_deref() {
+                let publish = match prev_snap.as_ref() {
                     None => snap.required_ok || snap.verified > 0,
                     Some(old) => probe::is_at_least_as_good(old, &snap),
                 };
                 if publish {
                     let block = render_hosts(&snap, &state.cfg.mode);
-                    state.publish(snap, &block).await;
+                    state.publish(snap, block).await;
                     tracing::info!("snapshot published to {}", state.store.describe());
                 } else {
-                    // The persisted file keeps the previous good result, which
+                    // The committed files keep the previous good result, which
                     // is the whole point of not overwriting on a worse cycle.
                     tracing::warn!("cycle worse than current snapshot; keeping previous");
                 }

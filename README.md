@@ -114,14 +114,31 @@ curl -s http://127.0.0.1:8080/hosts
 
 | 路径 | 内容 |
 |---|---|
+| `${STATE_DIR}/commit.json` | **提交点**：记录本轮 cycle、渲染 mode、`hosts.txt` 的哈希 |
 | `${STATE_DIR}/hosts.txt` | 渲染好的 block，`/hosts` 直接返回它 |
 | `${STATE_DIR}/snapshot.json` | 结构化结果，用于派生视图、状态页、重启恢复 |
 
 `STATE_DIR` 默认 `data`（容器内 `/data`）。容器里挂了 named volume，重建容器不会丢；不挂卷每次重建都要冷启动等一轮。
 
-- 写入是原子的：`.tmp` + rename + `sync_all`
+### 为什么多了一个 commit.json
+
+两个文件无法原子地一起替换。先后写会留下一个窗口：`hosts.txt` 已是新 cycle 而 `snapshot.json` 还是旧的（或反之），此时 `/hosts` 和 `/v1/snapshot` 会给出**不同的答案**；若第二次写失败，这个不一致会一直持续到下一轮成功。
+
+所以数据文件先写、`commit.json` 最后写。它记录 cycle、mode 和 `hosts.txt` 的哈希，读取方只信任与它一致的数据文件：
+
+- `/hosts` 与 `/v1/snapshot` 都由同一个 `authoritative()` 决策，**不可能互相矛盾**
+- `hosts.txt` 被外部改动（哈希不符）→ 判定磁盘状态失效，改用内存版本
+- `snapshot.json` 的 cycle 与 commit 不符 → 同样拒绝
+
+实测：手工往 `hosts.txt` 追加一行，接口仍返回 19 行未篡改内容，并打出 `hosts.txt does not match commit.json (cycle 1); treating disk state as stale`。
+
+### 落盘失败为什么安全
+
+因为 commit 是提交点，写失败时旧 commit 仍在，而内存里持有更新的好结果。`authoritative()` 见到 `persisted == false` 就直接用内存，不读盘——这正是"只读卷仍能继续服务"的实现方式（旧版本号称如此，实际却优先读盘，等于没用上内存回退）。
+
+- 单文件写入是原子的：`.tmp`（带 pid 防多实例互踩）+ rename + `sync_all`
+- Unix 上 rename 后额外 fsync 父目录，否则掉电可能丢失已报告的 rename
 - 文件损坏不会导致启动失败，只会忽略并重新探测
-- 落盘失败不影响服务：继续从内存提供内容，状态页和 `/healthz` 会**明确报出**这个错误
 
 ## 配置
 

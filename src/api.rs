@@ -51,18 +51,43 @@ fn family_of(host: &str) -> &'static str {
     }
 }
 
-/// Load the snapshot the way `/hosts` needs it: prefer the file on disk, fall
-/// back to memory only when the file cannot be read.
-async fn load_snapshot(st: &AppState) -> Option<Snapshot> {
-    match st.store.read_snapshot() {
-        Ok(s) => Some(s),
-        Err(e) => {
-            let mem = st.snapshot().await;
-            if mem.is_some() {
-                tracing::warn!("state file unreadable, serving memory copy: {e:#}");
-            }
-            mem.as_deref().cloned()
+/// The single authoritative version: `(snapshot, block-for-default-mode)`.
+///
+/// Resolves the "which one is the truth" question in one place so `/hosts`,
+/// `/v1/snapshot` and `/healthz` cannot disagree with each other:
+///
+/// * memory newer than disk (a write failed) -> serve memory;
+/// * disk and memory describe the same cycle  -> serve the disk bytes verbatim,
+///   which is what a client pasting the file expects;
+/// * memory empty but disk committed (boot)   -> serve disk.
+async fn authoritative(st: &AppState) -> Option<(Snapshot, String)> {
+    let mem = st.published().await;
+
+    // A failed write means memory is ahead of disk by definition: skip the read
+    // and serve the newer in-memory result. This is what makes "keep serving
+    // when the volume is read-only" true -- the old code read the stale disk
+    // copy instead and never used the memory fallback at all.
+    if let Some(p) = &mem {
+        if !p.persisted {
+            return Some((p.snapshot.clone(), p.block.clone()));
         }
+    }
+
+    let disk = match st.store.read_committed() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("state files unreadable: {e:#}");
+            None
+        }
+    };
+
+    match (mem, disk) {
+        (Some(p), Some(d)) if d.commit.cycle == p.snapshot.cycle_id && d.hosts == p.block => {
+            Some((d.snapshot, d.hosts))
+        }
+        (Some(p), _) => Some((p.snapshot.clone(), p.block.clone())),
+        (None, Some(d)) => Some((d.snapshot, d.hosts)),
+        (None, None) => None,
     }
 }
 
@@ -80,6 +105,22 @@ fn block_mode(block: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
+/// Does an `If-None-Match` header value match `etag`?
+///
+/// RFC 9110 §13.1.2: the field is a comma-separated list, may be `*`, and uses
+/// *weak* comparison (a `W/` prefix is ignored on either side). The previous
+/// exact-string check returned 200 for `"a", W/"current"` and for `*`.
+fn if_none_match_matches(header: &str, etag: &str) -> bool {
+    fn weak(tag: &str) -> &str {
+        tag.trim().trim_start_matches("W/").trim()
+    }
+    let target = weak(etag);
+    header.split(',').any(|part| {
+        let p = part.trim();
+        p == "*" || weak(p) == target
+    })
+}
+
 async fn hosts(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -87,53 +128,36 @@ async fn hosts(
 ) -> Response {
     let mode = q.mode.clone().unwrap_or_else(|| st.cfg.mode.clone());
 
-    // Fast path: the default view is exactly the file the probe wrote, so it is
-    // served verbatim without parsing or re-rendering -- but only when the file
-    // was actually rendered in the mode being asked for.
-    let mut from_file: Option<String> = None;
-    if q.families.is_none() {
-        if let Ok(b) = st.store.read_hosts() {
-            if !b.trim().is_empty() && block_mode(&b) == Some(mode.as_str()) {
-                from_file = Some(b);
-            } else if !b.trim().is_empty() {
-                tracing::debug!(
-                    "hosts.txt was rendered as {:?}, request wants {mode:?}; re-rendering",
-                    block_mode(&b)
-                );
-            }
-        }
-    }
+    let Some((snap, default_block)) = authoritative(&st).await else {
+        // Nothing verified yet: refuse to emit an empty block rather than let a
+        // consumer install a hosts file with no entries.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            format!(
+                "{}\n# probe cycle has not completed yet; retry shortly\n# <<< github-hosts <<<\n",
+                crate::render::BLOCK_BEGIN
+            ),
+        )
+            .into_response();
+    };
 
-    let mut body = match from_file {
-        Some(b) => b,
-        None => {
-            let Some(snap) = load_snapshot(&st).await else {
-                // Nothing verified yet: refuse to emit an empty block rather
-                // than let a consumer install a hosts file with no entries.
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                    format!(
-                        "{}\n# probe cycle has not completed yet; retry shortly\n# <<< github-hosts <<<\n",
-                        crate::render::BLOCK_BEGIN
-                    ),
-                )
-                    .into_response();
-            };
-            if let Some(fams) = &q.families {
-                let want: Vec<&str> = fams.split(',').map(|s| s.trim()).collect();
-                let mut filtered = snap.clone();
-                filtered
-                    .endpoints
-                    .retain(|e| want.contains(&family_of(&e.host)));
-                filtered.unverified.retain(|h| want.contains(&family_of(h)));
-                filtered.verified = filtered.endpoints.len();
-                filtered.expected = filtered.endpoints.len() + filtered.unverified.len();
-                render_hosts(&filtered, &mode)
-            } else {
-                render_hosts(&snap, &mode)
-            }
-        }
+    // Fast path: the default view is exactly the committed block, so it is served
+    // verbatim -- but only when it was rendered in the mode being asked for.
+    let mut body = if q.families.is_none() && block_mode(&default_block) == Some(mode.as_str()) {
+        default_block
+    } else if let Some(fams) = &q.families {
+        let want: Vec<&str> = fams.split(',').map(|s| s.trim()).collect();
+        let mut filtered = snap.clone();
+        filtered
+            .endpoints
+            .retain(|e| want.contains(&family_of(&e.host)));
+        filtered.unverified.retain(|h| want.contains(&family_of(h)));
+        filtered.verified = filtered.endpoints.len();
+        filtered.expected = filtered.endpoints.len() + filtered.unverified.len();
+        render_hosts(&filtered, &mode)
+    } else {
+        render_hosts(&snap, &mode)
     };
     if !body.ends_with('\n') {
         body.push('\n');
@@ -144,7 +168,7 @@ async fn hosts(
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
     {
-        if inm.trim() == etag || inm.trim().trim_start_matches("W/") == etag {
+        if if_none_match_matches(inm, &etag) {
             return (
                 StatusCode::NOT_MODIFIED,
                 [
@@ -170,8 +194,8 @@ async fn hosts(
 }
 
 async fn snapshot(State(st): State<Arc<AppState>>) -> Response {
-    match load_snapshot(&st).await {
-        Some(s) => Json(s).into_response(),
+    match authoritative(&st).await {
+        Some((s, _)) => Json(s).into_response(),
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "no snapshot yet"})),
@@ -266,8 +290,8 @@ async fn livez() -> Response {
 }
 
 async fn healthz(State(st): State<Arc<AppState>>) -> Response {
-    match load_snapshot(&st).await {
-        Some(s) => {
+    match authoritative(&st).await {
+        Some((s, _)) => {
             let code = if s.required_ok && s.git_ok {
                 StatusCode::OK
             } else {
@@ -301,7 +325,7 @@ async fn healthz(State(st): State<Arc<AppState>>) -> Response {
 }
 
 async fn index(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let snap = load_snapshot(&st).await;
+    let snap = authoritative(&st).await.map(|(s, _)| s);
     let probing = st.is_probing();
     let next = *st.next_probe_at.read().await;
     let interval = st.cfg.interval.as_secs();
@@ -383,5 +407,32 @@ mod tests {
         assert_eq!(block_mode("no header here"), None);
         // A truncated header must not panic.
         assert_eq!(block_mode("# >>> github-hosts :: mode="), Some(""));
+    }
+
+    #[test]
+    fn if_none_match_accepts_a_list_and_weak_tags() {
+        let etag = "\"abc123\"";
+        assert!(if_none_match_matches("\"abc123\"", etag));
+        assert!(if_none_match_matches("W/\"abc123\"", etag));
+        // The ETag itself may be quoted or not; weak comparison ignores W/ on
+        // both sides.
+        assert!(if_none_match_matches("\"zzz\", W/\"abc123\"", etag));
+        assert!(if_none_match_matches("  \"zzz\" ,  \"abc123\"  ", etag));
+        assert!(!if_none_match_matches("\"zzz\"", etag));
+        assert!(!if_none_match_matches("", etag));
+    }
+
+    #[test]
+    fn if_none_match_star_matches_anything() {
+        // RFC 9110: `*` matches if any current representation exists.
+        assert!(if_none_match_matches("*", "\"abc123\""));
+        assert!(if_none_match_matches(" \"zzz\" , * ", "\"abc123\""));
+    }
+
+    #[test]
+    fn if_none_match_does_not_match_a_prefix() {
+        // Guards against a substring comparison sneaking in.
+        assert!(!if_none_match_matches("\"abc12\"", "\"abc123\""));
+        assert!(!if_none_match_matches("\"abc1234\"", "\"abc123\""));
     }
 }

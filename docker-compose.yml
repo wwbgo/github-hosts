@@ -3,8 +3,8 @@ services:
     build:
       context: .
       args:
-        VERSION: "1.1.0"
-    image: ghcr.io/wwbgo/github-hosts:1.1.0
+        VERSION: "1.1.1"
+    image: ghcr.io/wwbgo/github-hosts:1.1.1
     container_name: github-hosts
     restart: unless-stopped
     ports:

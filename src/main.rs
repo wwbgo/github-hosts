@@ -70,9 +70,9 @@ async fn main() -> Result<()> {
 
     let state = AppState::new(cfg.clone());
     tracing::info!(
-        "github-hosts {VERSION}: interval={}s timeout={}s concurrency={} max_scan={} top_k={} mode={} state={}",
+        "github-hosts {VERSION}: interval={}s timeout={:.1}s concurrency={} max_scan={} top_k={} mode={} state={}",
         cfg.interval.as_secs(),
-        cfg.timeout.as_secs(),
+        cfg.timeout.as_secs_f64(),
         cfg.concurrency,
         cfg.max_scan,
         cfg.top_k,
@@ -94,6 +94,7 @@ async fn main() -> Result<()> {
                 let cycle_id = state.next_cycle_id();
                 tracing::info!("probe cycle {cycle_id} start");
                 state.set_probing(true);
+                *state.last_cycle_started_at.write().await = Some(chrono::Local::now());
                 *state.next_probe_at.write().await = None;
 
                 // Snapshot the previous result first so the new cycle can prefer
@@ -108,6 +109,27 @@ async fn main() -> Result<()> {
                     snap.git_ok,
                     snap.elapsed_ms
                 );
+
+                // Do not publish a cycle that verified nothing: with FAMILIES=""
+                // or all names misspelled, `jobs` is empty, which used to produce
+                // verified=0/expected=0/required_ok=true and satisfy the
+                // cold-start condition, publishing a header-only block.
+                if snap.verified == 0 {
+                    tracing::error!(
+                        "cycle {cycle_id} verified nothing (check FAMILIES={:?}); not publishing",
+                        std::env::var("FAMILIES").unwrap_or_default()
+                    );
+                    state.set_probing(false);
+                    let wait = jitter_delay(state.cfg.interval);
+                    *state.next_probe_at.write().await = Some(
+                        chrono::Local::now() + chrono::Duration::from_std(wait).unwrap_or_default(),
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        _ = state.refresh.notified() => {}
+                    }
+                    continue;
+                }
 
                 let publish = match prev.as_deref() {
                     None => snap.required_ok || snap.verified > 0,

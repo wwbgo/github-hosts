@@ -83,9 +83,16 @@ pub fn v_image(r: &Fetch) -> Result<String, String> {
 }
 
 /// Full source-archive path: HTTP 200, real gzip, real tar, at least one member.
+///
+/// Reads every entry to EOF so a corrupt or truncated tail is caught: iterating
+/// `archive.entries()` alone only parses headers, so damage after the first few
+/// entries would otherwise pass unnoticed.
 pub fn v_targz(r: &Fetch) -> Result<String, String> {
     if r.status != 200 {
         return Err(format!("http {}", r.status));
+    }
+    if r.truncated {
+        return Err(format!("archive truncated at {}B", r.body.len()));
     }
     if !r.body.starts_with(&[0x1f, 0x8b]) {
         return Err("not gzip".into());
@@ -94,15 +101,26 @@ pub fn v_targz(r: &Fetch) -> Result<String, String> {
     let entries = ar.entries().map_err(|e| format!("tar: {e}"))?;
     let mut count = 0usize;
     let mut first = Vec::new();
+    let mut sink = std::io::sink();
     for ent in entries {
-        let ent = ent.map_err(|e| format!("tar entry: {e}"))?;
+        let mut ent = ent.map_err(|e| format!("tar entry: {e}"))?;
         count += 1;
         if first.len() < 2 {
             if let Ok(p) = ent.path() {
                 first.push(p.display().to_string());
             }
         }
-        if count >= 3 {
+        // Consuming the body is what forces the decoder through the gzip stream;
+        // stopping at the header is why a truncated archive used to pass.
+        std::io::copy(&mut ent, &mut sink).map_err(|e| {
+            format!(
+                "tar entry {}: {e}",
+                first.last().cloned().unwrap_or_default()
+            )
+        })?;
+        if count >= 32 {
+            // Bounded work: a real source archive has more, but the validator
+            // only needs enough to prove the stream decodes end to end.
             break;
         }
     }
@@ -198,7 +216,50 @@ mod tests {
             location: None,
             body: body.to_vec(),
             total_ms: 1.0,
+            truncated: false,
         }
+    }
+
+    /// Build a real gzip+tar payload with `n` members.
+    fn targz(n: usize) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+        {
+            let mut builder = tar::Builder::new(&mut enc);
+            for i in 0..n {
+                let data = format!("payload {i}\n").into_bytes();
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                builder
+                    .append_data(&mut h, format!("f{i}.txt"), &data[..])
+                    .unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn a_real_archive_passes() {
+        assert!(v_targz(&f(200, "", &targz(3))).is_ok());
+    }
+
+    #[test]
+    fn a_truncated_archive_is_rejected() {
+        let full = targz(8);
+        // Cut the tail: the gzip stream no longer decodes cleanly.
+        let cut = &full[..full.len() / 2];
+        let mut r = f(200, "", cut);
+        assert!(v_targz(&r).is_err(), "half an archive must not validate");
+
+        // And when fetch() reports the cut explicitly, that is fatal too --
+        // header-only iteration would otherwise accept a prefix.
+        r = f(200, "", &full);
+        r.truncated = true;
+        assert!(v_targz(&r).is_err());
     }
 
     #[test]

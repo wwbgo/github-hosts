@@ -6,6 +6,7 @@
 //! failing, and the source for derived views (custom mode or family filter),
 //! which are rendered from the persisted JSON.
 
+use crate::config::Config;
 use crate::page;
 use crate::probe::Snapshot;
 use crate::render::content_hash;
@@ -183,13 +184,67 @@ async fn snapshot(State(st): State<Arc<AppState>>) -> Response {
 struct RefreshAck {
     accepted: bool,
     current_cycle: u64,
+    /// Set when the request was declined; explains why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rejected: Option<String>,
+    /// Seconds until a refresh will be accepted, when the request was refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after_secs: Option<i64>,
+}
+
+/// Minimum spacing between two cycle starts, whatever triggered them.
+///
+/// `Notify` coalesces into a permit, so without this an unauthenticated caller
+/// could keep the prober running back to back forever, defeating the whole
+/// point of the interval floor. One probe cycle per minute is still far more
+/// than the measurements need; the configured interval governs the normal path.
+fn refresh_floor(cfg: &Config) -> std::time::Duration {
+    std::time::Duration::from_secs(60).min(cfg.interval)
 }
 
 async fn refresh(State(st): State<Arc<AppState>>) -> Response {
+    let cycle = st.cycle.load(std::sync::atomic::Ordering::Relaxed);
+
+    if st.is_probing() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(RefreshAck {
+                accepted: false,
+                current_cycle: cycle,
+                rejected: Some("a cycle is already running".into()),
+                retry_after_secs: Some(30),
+            }),
+        )
+            .into_response();
+    }
+
+    if let Some(started) = *st.last_cycle_started_at.read().await {
+        let elapsed = chrono::Local::now() - started;
+        let floor = refresh_floor(&st.cfg);
+        if let Ok(elapsed) = elapsed.to_std() {
+            if elapsed < floor {
+                let wait = (floor - elapsed).as_secs() as i64;
+                tracing::info!("refresh refused: {wait}s of the floor remaining");
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(RefreshAck {
+                        accepted: false,
+                        current_cycle: cycle,
+                        rejected: Some("minimum interval between probe cycles not reached".into()),
+                        retry_after_secs: Some(wait),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     st.refresh.notify_one();
     Json(RefreshAck {
         accepted: true,
-        current_cycle: st.cycle.load(std::sync::atomic::Ordering::Relaxed),
+        current_cycle: cycle,
+        rejected: None,
+        retry_after_secs: None,
     })
     .into_response()
 }

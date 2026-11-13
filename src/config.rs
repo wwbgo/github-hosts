@@ -85,6 +85,21 @@ fn num<L: Lookup, T: std::str::FromStr>(l: &L, key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// Parse a timeout in seconds, clamped to something `Duration` accepts.
+///
+/// `Duration::from_secs_f64` *panics* on a negative, NaN or infinite value, and
+/// `parse::<f64>()` happily accepts `-1`, `NaN` and `inf`. So a single mistyped
+/// env var used to abort the process at startup with a backtrace instead of
+/// reporting a bad configuration. Anything unusable falls back to the default.
+fn num_secs_f64<L: Lookup>(l: &L, key: &str, default: f64) -> f64 {
+    const MIN: f64 = 0.1;
+    const MAX: f64 = 600.0;
+    match l.get(key).and_then(|v| v.trim().parse::<f64>().ok()) {
+        Some(v) if v.is_finite() && v > 0.0 => v.clamp(MIN, MAX),
+        Some(_) | None => default,
+    }
+}
+
 impl Config {
     pub fn from_env() -> Self {
         Self::from_lookup(&Env)
@@ -105,7 +120,11 @@ impl Config {
         Self {
             port: num(l, "PORT", d.port),
             interval: Duration::from_secs(interval_secs),
-            timeout: Duration::from_secs_f64(num(l, "PROBE_TIMEOUT_SECS", d.timeout.as_secs_f64())),
+            timeout: Duration::from_secs_f64(num_secs_f64(
+                l,
+                "PROBE_TIMEOUT_SECS",
+                d.timeout.as_secs_f64(),
+            )),
             concurrency: num(l, "CONCURRENCY", d.concurrency).max(1),
             max_scan: num(l, "MAX_SCAN", d.max_scan).max(1),
             top_k: num(l, "TOP_K", d.top_k).max(1),
@@ -170,5 +189,47 @@ mod tests {
         assert_eq!(c.concurrency, 1);
         assert_eq!(c.top_k, 1);
         assert_eq!(c.repeats, 1);
+    }
+
+    #[test]
+    fn non_positive_or_non_finite_timeout_does_not_panic() {
+        // Duration::from_secs_f64 panics on these; a mistyped env var used to
+        // abort the process at startup (verified exit code 101).
+        let default = Config::default().timeout.as_secs_f64();
+        for bad in ["-1", "NaN", "inf", "-inf", "0", ""] {
+            let c = cfg_with(&[("PROBE_TIMEOUT_SECS", bad)]);
+            assert!(
+                c.timeout.as_secs_f64() > 0.0,
+                "PROBE_TIMEOUT_SECS={bad:?} produced a non-positive timeout"
+            );
+            assert_eq!(
+                c.timeout.as_secs_f64(),
+                default,
+                "expected fallback for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sane_timeout_is_kept() {
+        assert!(
+            (cfg_with(&[("PROBE_TIMEOUT_SECS", "9.5")])
+                .timeout
+                .as_secs_f64()
+                - 9.5)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
+    fn absurd_timeouts_are_clamped_not_honoured() {
+        // A 7-hour per-socket timeout would make one blocked cycle run forever.
+        assert!(
+            cfg_with(&[("PROBE_TIMEOUT_SECS", "99999")])
+                .timeout
+                .as_secs()
+                <= 600
+        );
     }
 }

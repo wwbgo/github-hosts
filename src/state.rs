@@ -26,6 +26,9 @@ pub struct AppState {
     /// When the next probe is due. Published by the scheduler so the status
     /// page can say "next at ..." without guessing.
     pub next_probe_at: RwLock<Option<DateTime<Local>>>,
+    /// When the current/last cycle started. `POST /v1/refresh` consults this so
+    /// a caller cannot drive back-to-back cycles and defeat the interval floor.
+    pub last_cycle_started_at: RwLock<Option<DateTime<Local>>>,
     /// Set while a cycle is running, so the page can distinguish "idle" from
     /// "probing right now".
     pub probing: AtomicBool,
@@ -43,6 +46,7 @@ impl AppState {
             refresh: Notify::new(),
             cycle: AtomicU64::new(0),
             next_probe_at: RwLock::new(None),
+            last_cycle_started_at: RwLock::new(None),
             probing: AtomicBool::new(false),
             last_save_error: RwLock::new(None),
         })

@@ -649,32 +649,61 @@ pub async fn run_cycle(cfg: &Config, cycle_id: u64, prev: Option<&Snapshot>) -> 
                         shortlist.push(a.ip);
                     }
                 }
-                // Stickiness: if this host's previous IP survived the screen,
-                // try it first and keep it.
-                if let Some(p) = prev {
-                    if let Some(pe) = p
-                        .endpoints
-                        .iter()
-                        .find(|e| e.host == job.host && e.verified)
+                // Stickiness: try the host's previous IP first and, if it still
+                // validates, keep it regardless of latency. Two things the old
+                // version got wrong: it only reordered the shortlist (so a
+                // faster peer still won the latency sort), and an IP outside the
+                // shortlist was never re-tested at all even if it still worked.
+                let previous = prev
+                    .and_then(|p| {
+                        p.endpoints
+                            .iter()
+                            .find(|e| e.host == job.host && e.verified)
+                    })
+                    .and_then(|e| e.ip.parse::<IpAddr>().ok());
+                let deadline = tokio::time::Instant::now() + HOST_BUDGET;
+                if let Some(pip) = previous {
+                    match tokio::time::timeout_at(
+                        deadline,
+                        validate_host(&sub, job.host, &job.targets, pip),
+                    )
+                    .await
                     {
-                        if let Ok(pip) = pe.ip.parse::<IpAddr>() {
-                            if let Some(pos) = shortlist.iter().position(|x| *x == pip) {
-                                let ip = shortlist.remove(pos);
-                                shortlist.insert(0, ip);
-                            }
+                        Ok(Some(ep)) => {
+                            tracing::debug!("{host} keeps previous IP {pip}", host = job.host);
+                            return (job.host, Some(ep), job.required);
+                        }
+                        Ok(None) => { /* it no longer works; fall through */ }
+                        Err(_) => {
+                            tracing::debug!("{host} sticky check hit the budget", host = job.host);
                         }
                     }
+                    shortlist.retain(|ip| *ip != pip);
                 }
-                let deadline = Instant::now() + HOST_BUDGET;
+
                 let mut start = 0usize;
-                while start < shortlist.len() && Instant::now() < deadline {
+                while start < shortlist.len() && tokio::time::Instant::now() < deadline {
                     let end = (start + WAVE).min(shortlist.len());
                     let batch: Vec<IpAddr> = shortlist[start..end].to_vec();
-                    let results: Vec<Option<Endpoint>> = stream::iter(batch)
-                        .map(|ip| validate_host(&sub, job.host, &job.targets, ip))
-                        .buffer_unordered(WAVE)
-                        .collect()
-                        .await;
+                    // Bound the wave by what is left of the host budget.
+                    // Checking the deadline only before starting a wave let a
+                    // fully-blocked host overrun it by one full wave (~12 s at
+                    // the defaults), which is how 25 s turned into ~37 s.
+                    let results: Vec<Option<Endpoint>> = match tokio::time::timeout_at(
+                        deadline,
+                        stream::iter(batch)
+                            .map(|ip| validate_host(&sub, job.host, &job.targets, ip))
+                            .buffer_unordered(WAVE)
+                            .collect::<Vec<_>>(),
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => {
+                            tracing::debug!("{} hit the {HOST_BUDGET:?} budget", job.host);
+                            break;
+                        }
+                    };
                     let mut ok: Vec<Endpoint> = results.into_iter().flatten().collect();
                     if !ok.is_empty() {
                         ok.sort_by(|a, b| {
@@ -686,7 +715,7 @@ pub async fn run_cycle(cfg: &Config, cycle_id: u64, prev: Option<&Snapshot>) -> 
                     }
                     start = end;
                 }
-                if Instant::now() >= deadline {
+                if tokio::time::Instant::now() >= deadline {
                     tracing::debug!("{} hit the {HOST_BUDGET:?} budget", job.host);
                 }
                 (job.host, None, job.required)

@@ -19,6 +19,13 @@ pub struct Fetch {
     pub location: Option<String>,
     pub body: Vec<u8>,
     pub total_ms: f64,
+    /// True when the body hit the caller's `max_body` and was cut short.
+    ///
+    /// Validators that need the *whole* payload (a tar.gz, an image) must check
+    /// this: without it a truncated download is indistinguishable from a short
+    /// but complete one, and `tar` only reads entry headers until an entry's
+    /// contents are consumed, so a truncated tail could pass.
+    pub truncated: bool,
 }
 
 const MAX_BODY_HARD_CAP: usize = 16 * 1024 * 1024;
@@ -72,12 +79,19 @@ pub async fn fetch(c: &Client, url: &str, max_body: usize, ua: &str) -> Result<F
     // Stream and stop as soon as we have enough. Reading the whole body would
     // make every check hostage to a mid-transfer stall, which is exactly the
     // failure mode that appears under interference on this kind of link.
+    //
+    // Stopping at `max_body` means the body may be a prefix, so `truncated` is
+    // set whenever the cap was reached. It is deliberately conservative: a
+    // payload of exactly `max_body` bytes is reported as truncated, because the
+    // caller cannot tell the difference and validators must not guess.
     let mut body: Vec<u8> = Vec::with_capacity(max_body.min(256 * 1024));
+    let mut truncated = false;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         body.extend_from_slice(&chunk);
         if body.len() >= max_body {
+            truncated = true;
             break;
         }
     }
@@ -85,12 +99,17 @@ pub async fn fetch(c: &Client, url: &str, max_body: usize, ua: &str) -> Result<F
     if body.len() > max_body {
         body.truncate(max_body);
     }
+    // A body shorter than the cap arrived whole.
+    if body.len() < max_body {
+        truncated = false;
+    }
     Ok(Fetch {
         status,
         content_type,
         location,
         body,
         total_ms,
+        truncated,
     })
 }
 

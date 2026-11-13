@@ -1,0 +1,7 @@
+target/
+NUL
+*.tgz
+*.tmp
+
+# runtime state (hosts.txt + snapshot.json); never committed
+data/

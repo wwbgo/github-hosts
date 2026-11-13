@@ -1,0 +1,29 @@
+[package]
+name = "github-hosts"
+version = "1.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Probe GitHub edge IPs and serve a verified hosts block over HTTP"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-webpki-roots",
+    "http2",
+    "stream",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+flate2 = "1"
+tar = "0.4"
+futures = "0.3"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true

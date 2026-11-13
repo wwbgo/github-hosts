@@ -1,0 +1,21 @@
+# Normalise line endings on commit. These sources are edited on Windows but
+# built and tested on Linux in CI, and CRLF breaks Dockerfile continuations and
+# any shebang line. The repository stores LF; checkouts get LF everywhere.
+* text=auto eol=lf
+
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf
+*.sh    text eol=lf
+Dockerfile          text eol=lf
+.dockerignore       text eol=lf
+.gitignore          text eol=lf
+.gitattributes      text eol=lf
+docker-compose.yml  text eol=lf
+
+# Binaries, if any are ever added, must never be normalised.
+*.png binary
+*.jpg binary
+*.gz  binary

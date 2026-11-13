@@ -1,0 +1,50 @@
+services:
+  github-hosts:
+    build:
+      context: .
+      args:
+        VERSION: "1.1.0"
+    image: ghcr.io/wwbgo/github-hosts:1.1.0
+    container_name: github-hosts
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Cadence is clamped to a 600 s floor in code. 900 s keeps the cached
+      # block fresh while staying far from anything that reads as a flood.
+      INTERVAL_SECS: "900"
+      PROBE_TIMEOUT_SECS: "6"
+      CONCURRENCY: "12"
+      MAX_SCAN: "40"
+      TOP_K: "12"
+      REPEATS: "2"
+      HOSTS_MODE: "pin"
+      STATE_DIR: "/data"
+      TZ: "Asia/Shanghai"
+      RUST_LOG: "info"
+    volumes:
+      # Persisted hosts.txt + snapshot.json. Without this the API would start
+      # cold on every recreate and answer 503 until the first cycle ends.
+      - github-hosts-data:/data
+    # Declared here, not only in the Dockerfile: Podman ignores a Dockerfile
+    # HEALTHCHECK when it builds OCI-format images.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    # A probe cycle is tiny (a few hundred KB). The limits are here so a bug
+    # cannot starve the host.
+    deploy:
+      resources:
+        limits:
+          memory: 192M
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  github-hosts-data:

@@ -158,11 +158,12 @@ pub fn v_zen(r: &Fetch) -> Result<String, String> {
     Ok(format!("api {}B", r.body.len()))
 }
 
-/// Signed URLs are required for a real payload fetch on the object hosts, so
-/// any HTTP response on the correct hostname is treated as proof of service.
+/// Object/asset hosts require a signed URL for a real payload fetch, so any
+/// answer on the correct hostname proves the edge serves it -- but a 5xx means
+/// the edge answered and then failed, which is not proof of service.
 pub fn v_reachable(r: &Fetch) -> Result<String, String> {
-    if r.status == 0 {
-        return Err("no response".into());
+    if r.status >= 500 {
+        return Err(format!("http {}", r.status));
     }
     Ok(format!("http {}", r.status))
 }
@@ -184,4 +185,69 @@ pub fn v_git(r: &Fetch) -> Result<String, String> {
         r.content_type,
         String::from_utf8_lossy(&r.body[..r.body.len().min(24)])
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn f(status: u16, ctype: &str, body: &[u8]) -> Fetch {
+        Fetch {
+            status,
+            content_type: ctype.to_string(),
+            location: None,
+            body: body.to_vec(),
+            total_ms: 1.0,
+        }
+    }
+
+    #[test]
+    fn reachable_rejects_server_errors_but_accepts_client_errors() {
+        // A 404/403 on these hosts is expected (no signed URL / no such object)
+        // and still proves the edge serves the name. A 5xx does not.
+        assert!(v_reachable(&f(404, "", b"")).is_ok());
+        assert!(v_reachable(&f(403, "", b"")).is_ok());
+        assert!(v_reachable(&f(302, "", b"")).is_ok());
+        assert!(v_reachable(&f(500, "", b"")).is_err());
+        assert!(v_reachable(&f(503, "", b"")).is_err());
+    }
+
+    #[test]
+    fn codeload_rejects_a_redirect_even_when_it_points_at_github() {
+        // The redirect target is a 404 in practice; accepting it would publish
+        // an IP where "Download ZIP" is broken.
+        let mut r = f(301, "", b"");
+        r.location = Some("https://github.com/o/r/tar.gz/refs/heads/main".into());
+        assert!(v_codeload(&r).is_err());
+    }
+
+    #[test]
+    fn codeload_requires_gzip_magic() {
+        assert!(v_codeload(&f(200, "", b"Not Found")).is_err());
+        // gzip magic but garbage payload: header parses, body does not.
+        assert!(v_codeload(&f(200, "", &[0x1f, 0x8b, 0x08, 0x00])).is_err());
+    }
+
+    #[test]
+    fn html_rejects_short_and_non_github_pages() {
+        assert!(v_html(&f(200, "text/html", b"<html>github</html>")).is_err());
+        let filler = "x".repeat(4000);
+        assert!(v_html(&f(200, "text/html", filler.as_bytes())).is_err());
+        let ok = format!("<html><body>github {}</body></html>", "y".repeat(4000));
+        assert!(v_html(&f(200, "text/html", ok.as_bytes())).is_ok());
+    }
+
+    #[test]
+    fn asset_requires_a_usable_content_type() {
+        assert!(v_asset(&f(200, "text/html; charset=utf-8", &[b'x'; 128])).is_err());
+        assert!(v_asset(&f(200, "text/css", &[b'x'; 128])).is_ok());
+        assert!(v_asset(&f(200, "image/png", b"tiny")).is_err());
+    }
+
+    #[test]
+    fn image_needs_real_magic_bytes() {
+        assert!(v_image(&f(200, "", b"<html>nope</html>")).is_err());
+        assert!(v_image(&f(200, "", b"\x89PNG\r\n\x1a\nrest")).is_ok());
+        assert!(v_image(&f(200, "", b"GIF89a rest")).is_ok());
+    }
 }

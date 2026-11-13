@@ -27,6 +27,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/snapshot", get(snapshot))
         .route("/v1/refresh", post(refresh))
         .route("/healthz", get(healthz))
+        .route("/livez", get(livez))
         .with_state(state)
 }
 
@@ -64,30 +65,45 @@ async fn load_snapshot(st: &AppState) -> Option<Snapshot> {
     }
 }
 
+/// The `mode=` value baked into a rendered block's header line, if present.
+///
+/// Needed because the file on disk was rendered under whatever mode was
+/// configured *then*. Comparing the request against the current config alone is
+/// wrong: switch `HOSTS_MODE` from `pin` to `auto`, restart, and a `?mode=auto`
+/// request would match the config and be served the stale `pin` block.
+fn block_mode(block: &str) -> Option<&str> {
+    let line = block.lines().next()?;
+    let start = line.find("mode=")? + "mode=".len();
+    let rest = &line[start..];
+    let end = rest.find([' ', ':']).unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
 async fn hosts(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     q: Query<HostsQuery>,
 ) -> Response {
     let mode = q.mode.clone().unwrap_or_else(|| st.cfg.mode.clone());
-    let wants_derived = q.families.is_some() || mode != st.cfg.mode;
 
     // Fast path: the default view is exactly the file the probe wrote, so it is
-    // served verbatim without parsing or re-rendering.
-    let body = if !wants_derived {
-        match st.store.read_hosts() {
-            Ok(b) if !b.trim().is_empty() => Some(b),
-            Ok(_) => None,
-            Err(e) => {
-                tracing::debug!("hosts.txt unavailable: {e:#}");
-                None
+    // served verbatim without parsing or re-rendering -- but only when the file
+    // was actually rendered in the mode being asked for.
+    let mut from_file: Option<String> = None;
+    if q.families.is_none() {
+        if let Ok(b) = st.store.read_hosts() {
+            if !b.trim().is_empty() && block_mode(&b) == Some(mode.as_str()) {
+                from_file = Some(b);
+            } else if !b.trim().is_empty() {
+                tracing::debug!(
+                    "hosts.txt was rendered as {:?}, request wants {mode:?}; re-rendering",
+                    block_mode(&b)
+                );
             }
         }
-    } else {
-        None
-    };
+    }
 
-    let mut body = match body {
+    let mut body = match from_file {
         Some(b) => b,
         None => {
             let Some(snap) = load_snapshot(&st).await else {
@@ -178,6 +194,22 @@ async fn refresh(State(st): State<Arc<AppState>>) -> Response {
     .into_response()
 }
 
+/// Liveness only: is this process serving HTTP at all?
+///
+/// Deliberately separate from `/healthz`. `/healthz` reports whether the last
+/// probe produced a fully verified block, and during a blockade it answers 503
+/// *because the tool is working correctly*. Pointing a container HEALTHCHECK at
+/// that makes the container look broken exactly when it is doing its job, and a
+/// restarter would loop it forever. Containers should probe this endpoint;
+/// humans and dashboards should read `/healthz`.
+async fn livez() -> Response {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "status": "alive" })),
+    )
+        .into_response()
+}
+
 async fn healthz(State(st): State<Arc<AppState>>) -> Response {
     match load_snapshot(&st).await {
         Some(s) => {
@@ -265,5 +297,36 @@ async fn index(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response 
             ),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_mode_reads_the_rendered_mode() {
+        let pin = "# >>> github-hosts :: 2026-11-13T12:00:00+08:00 :: mode=pin :: v1.1.0 >>>\n140.82.121.3 github.com\n";
+        assert_eq!(block_mode(pin), Some("pin"));
+
+        let auto = "# >>> github-hosts :: 2026-11-13T12:00:00+08:00 :: mode=auto :: v1.1.0 >>>\n";
+        assert_eq!(block_mode(auto), Some("auto"));
+    }
+
+    #[test]
+    fn block_mode_distinguishes_modes_so_a_stale_file_is_not_served() {
+        // The regression this guards: switching HOSTS_MODE from pin to auto and
+        // asking for ?mode=auto used to compare against the *config* and serve
+        // the stale pin file verbatim.
+        let pin_file = "# >>> github-hosts :: t :: mode=pin :: v1.1.0 >>>\n";
+        assert_ne!(block_mode(pin_file), Some("auto"));
+    }
+
+    #[test]
+    fn block_mode_tolerates_junk() {
+        assert_eq!(block_mode(""), None);
+        assert_eq!(block_mode("no header here"), None);
+        // A truncated header must not panic.
+        assert_eq!(block_mode("# >>> github-hosts :: mode="), Some(""));
     }
 }

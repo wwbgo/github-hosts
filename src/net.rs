@@ -95,6 +95,10 @@ pub async fn fetch(c: &Client, url: &str, max_body: usize, ua: &str) -> Result<F
 }
 
 /// Resolve a hostname through the container's resolver, IPv4 only.
+///
+/// Note this goes through the OS resolver, so it is exactly the path that may
+/// be poisoned -- the result is only ever used as a *candidate* list, never
+/// trusted as an answer.
 pub async fn resolve_v4(host: &str) -> Vec<IpAddr> {
     let mut out: Vec<IpAddr> = Vec::new();
     if let Ok(it) = tokio::net::lookup_host((host, 443u16)).await {
@@ -102,18 +106,6 @@ pub async fn resolve_v4(host: &str) -> Vec<IpAddr> {
             let ip = sa.ip();
             if ip.is_ipv4() && !out.contains(&ip) {
                 out.push(ip);
-            }
-        }
-    }
-    if out.is_empty() {
-        // A poisoned resolver can return nothing usable; fall back to the
-        // system resolver result via the OS route used by `getaddrinfo`.
-        if let Ok(it) = tokio::net::lookup_host(format!("{host}:443")).await {
-            for sa in it {
-                let ip = sa.ip();
-                if ip.is_ipv4() && !out.contains(&ip) {
-                    out.push(ip);
-                }
             }
         }
     }

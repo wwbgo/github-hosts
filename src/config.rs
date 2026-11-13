@@ -58,37 +58,60 @@ impl Default for Config {
     }
 }
 
-fn env_num<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key)
-        .ok()
+/// Anything that can supply a configuration value by name. `Config::from_env`
+/// uses the process environment; tests supply a plain map instead, so they do
+/// not mutate global state that other tests read concurrently.
+pub trait Lookup {
+    fn get(&self, key: &str) -> Option<String>;
+}
+
+impl Lookup for std::collections::HashMap<String, String> {
+    fn get(&self, key: &str) -> Option<String> {
+        self.get(key).cloned()
+    }
+}
+
+struct Env;
+
+impl Lookup for Env {
+    fn get(&self, key: &str) -> Option<String> {
+        std::env::var(key).ok()
+    }
+}
+
+fn num<L: Lookup, T: std::str::FromStr>(l: &L, key: &str, default: T) -> T {
+    l.get(key)
         .and_then(|v| v.trim().parse::<T>().ok())
         .unwrap_or(default)
 }
 
 impl Config {
     pub fn from_env() -> Self {
+        Self::from_lookup(&Env)
+    }
+
+    /// Build from any value source. Kept separate from `from_env` so tests can
+    /// exercise clamping without touching the process environment: `set_var`
+    /// is global, and two tests doing it in parallel race (this flaked 3 runs
+    /// in 10 before the split).
+    pub fn from_lookup<L: Lookup>(l: &L) -> Self {
         let d = Self::default();
 
         // Clamped rather than rejected: a small value should not stop the
         // service, but it also should not turn it into a request flood.
-        let requested = env_num("INTERVAL_SECS", d.interval.as_secs());
+        let requested = num(l, "INTERVAL_SECS", d.interval.as_secs());
         let interval_secs = requested.max(MIN_INTERVAL_SECS);
 
         Self {
-            port: env_num("PORT", d.port),
+            port: num(l, "PORT", d.port),
             interval: Duration::from_secs(interval_secs),
-            timeout: Duration::from_secs_f64(env_num(
-                "PROBE_TIMEOUT_SECS",
-                d.timeout.as_secs_f64(),
-            )),
-            concurrency: env_num("CONCURRENCY", d.concurrency).max(1),
-            max_scan: env_num("MAX_SCAN", d.max_scan).max(1),
-            top_k: env_num("TOP_K", d.top_k).max(1),
-            repeats: env_num("REPEATS", d.repeats).max(1),
-            mode: std::env::var("HOSTS_MODE").unwrap_or(d.mode),
-            state_dir: std::env::var("STATE_DIR")
-                .map(PathBuf::from)
-                .unwrap_or(d.state_dir),
+            timeout: Duration::from_secs_f64(num(l, "PROBE_TIMEOUT_SECS", d.timeout.as_secs_f64())),
+            concurrency: num(l, "CONCURRENCY", d.concurrency).max(1),
+            max_scan: num(l, "MAX_SCAN", d.max_scan).max(1),
+            top_k: num(l, "TOP_K", d.top_k).max(1),
+            repeats: num(l, "REPEATS", d.repeats).max(1),
+            mode: l.get("HOSTS_MODE").unwrap_or(d.mode),
+            state_dir: l.get("STATE_DIR").map(PathBuf::from).unwrap_or(d.state_dir),
         }
     }
 }
@@ -96,6 +119,15 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    fn cfg_with(pairs: &[(&str, &str)]) -> Config {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        Config::from_lookup(&map)
+    }
 
     #[test]
     fn default_interval_is_above_the_floor() {
@@ -105,19 +137,38 @@ mod tests {
     }
 
     #[test]
-    fn interval_from_env_is_clamped_up_to_the_floor() {
+    fn interval_below_the_floor_is_clamped_up() {
         // A caller passing a tiny value gets the floor, not a flood.
-        std::env::set_var("INTERVAL_SECS", "5");
-        let c = Config::from_env();
-        assert_eq!(c.interval.as_secs(), MIN_INTERVAL_SECS);
-        std::env::remove_var("INTERVAL_SECS");
+        assert_eq!(
+            cfg_with(&[("INTERVAL_SECS", "5")]).interval.as_secs(),
+            MIN_INTERVAL_SECS
+        );
+        assert_eq!(
+            cfg_with(&[("INTERVAL_SECS", "0")]).interval.as_secs(),
+            MIN_INTERVAL_SECS
+        );
     }
 
     #[test]
-    fn interval_from_env_above_the_floor_is_honoured() {
-        std::env::set_var("INTERVAL_SECS", "3600");
-        let c = Config::from_env();
-        assert_eq!(c.interval.as_secs(), 3600);
-        std::env::remove_var("INTERVAL_SECS");
+    fn interval_above_the_floor_is_honoured() {
+        assert_eq!(
+            cfg_with(&[("INTERVAL_SECS", "3600")]).interval.as_secs(),
+            3600
+        );
+    }
+
+    #[test]
+    fn unparsable_values_fall_back_to_defaults() {
+        let c = cfg_with(&[("INTERVAL_SECS", "soon"), ("CONCURRENCY", "")]);
+        assert_eq!(c.interval.as_secs(), DEFAULT_INTERVAL_SECS);
+        assert_eq!(c.concurrency, Config::default().concurrency);
+    }
+
+    #[test]
+    fn zero_is_raised_to_one_where_zero_would_stall() {
+        let c = cfg_with(&[("CONCURRENCY", "0"), ("TOP_K", "0"), ("REPEATS", "0")]);
+        assert_eq!(c.concurrency, 1);
+        assert_eq!(c.top_k, 1);
+        assert_eq!(c.repeats, 1);
     }
 }

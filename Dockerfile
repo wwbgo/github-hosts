@@ -52,9 +52,9 @@ EXPOSE 8080
 # Unprivileged: the service only needs to write under /data.
 USER 65534:65534
 
-# Podman ignores a Dockerfile HEALTHCHECK for OCI-format images; compose
-# declares its own. Kept here for plain docker build/run.
+# Liveness, not data quality: /healthz answers 503 during a blockade even though
+# the service is working exactly as designed. See src/api.rs.
 HEALTHCHECK --interval=60s --timeout=5s --start-period=90s --retries=3 \
-  CMD curl -fsS "http://127.0.0.1:${PORT}/healthz" || exit 1
+  CMD curl -fsS "http://127.0.0.1:${PORT}/livez" || exit 1
 
 ENTRYPOINT ["/usr/local/bin/github-hosts"]

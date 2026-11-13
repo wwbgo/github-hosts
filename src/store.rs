@@ -52,7 +52,10 @@ impl Store {
     fn atomic_write(&self, name: &str, bytes: &[u8]) -> Result<()> {
         self.ensure_dir()?;
         let target = self.dir.join(name);
-        let tmp = self.dir.join(format!(".{name}.tmp"));
+        // Per-process temp name: a fixed `.name.tmp` lets two instances sharing
+        // a state dir overwrite each other's partial write and then rename it
+        // into place as if it were their own.
+        let tmp = self.dir.join(format!(".{name}.{}.tmp", std::process::id()));
 
         {
             let mut f =

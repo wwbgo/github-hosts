@@ -101,7 +101,8 @@ curl -s http://127.0.0.1:8080/hosts
 | GET | `/hosts?families=web,raw` | 只要指定分组（web / api / raw / assets / pages） |
 | GET | `/v1/snapshot` | 完整探测详情 JSON（读 `snapshot.json`） |
 | POST | `/v1/refresh` | 立即触发一轮探测，返回 202 |
-| GET | `/healthz` | 存活 + 验证状态 + 落盘状态；必需项或 git 未通过返回 503 |
+| GET | `/healthz` | 数据质量：必需项或 git 未通过时返回 503 |
+| GET | `/livez` | 存活检查，只要进程在服务就 200（容器 HEALTHCHECK 用这个） |
 
 设计上的三个承诺：
 

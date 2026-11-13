@@ -33,7 +33,28 @@ async fn main() -> Result<()> {
     // CI or a scheduled task without keeping the server up.
     if args.iter().any(|a| a == "--once") {
         let store = store::Store::new(&cfg.state_dir);
-        let snap = probe::run_cycle(&cfg, 1, None).await;
+        let existing = store.load_optional();
+        let cycle_id = existing.as_ref().map(|s| s.cycle_id + 1).unwrap_or(1);
+        let snap = probe::run_cycle(&cfg, cycle_id, existing.as_ref()).await;
+
+        // Warn before clobbering a better result: running --once during a bad
+        // window while the daemon holds a good snapshot would otherwise publish
+        // the worse one to disk. The write still happens -- --once is an
+        // explicit request -- but never silently.
+        if let Some(old) = &existing {
+            if !probe::is_at_least_as_good(old, &snap) {
+                tracing::warn!(
+                    "this cycle is worse than the stored one ({} required / {} total, vs {} / {}); \
+                     overwriting {} anyway because --once was requested",
+                    snap.required_hits(),
+                    snap.verified,
+                    old.required_hits(),
+                    old.verified,
+                    store.hosts_path().display()
+                );
+            }
+        }
+
         let block = render_hosts(&snap, &cfg.mode);
         match store.save(&block, &snap) {
             Ok(()) => tracing::info!("state written to {}", store.describe()),

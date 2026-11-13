@@ -14,7 +14,6 @@
 use crate::config::Config;
 use crate::net::{fetch, pinned_client, resolve_v4};
 use crate::validators::*;
-use anyhow::Result;
 use chrono::{DateTime, Local};
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -302,10 +301,19 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Number of required endpoints that are actually verified.
-    pub fn required_verified(&self) -> usize {
-        self.endpoints.iter().filter(|e| e.verified).count()
+    /// Hosts that a consumer cannot function without (see `targets()`).
+    pub fn required_hits(&self) -> usize {
+        self.endpoints
+            .iter()
+            .filter(|e| e.verified && host_is_required(&e.host))
+            .count()
     }
+}
+
+/// Whether any target for `host` is marked required, i.e. the block is
+/// incomplete without it.
+pub fn host_is_required(host: &str) -> bool {
+    targets().iter().any(|t| t.host == host && t.required)
 }
 
 fn enabled(f: Family) -> bool {
@@ -387,30 +395,41 @@ impl Alive {
 /// Deliberately a single attempt per IP: a connect timeout here means a
 /// blackholed route, and repeating it just multiplies the delay by the number
 /// of dead candidates. Latency is re-measured during stage 2 anyway.
-async fn screen(cfg: &Config, host: &'static str, ips: Vec<IpAddr>) -> Vec<Alive> {
+///
+/// All families are screened in one flat stream so `concurrency` is a true
+/// global bound. Screening them one after another made the slowest part of a
+/// cycle additive: five families times ~24 s each is where the observed 80 s
+/// cycles came from.
+async fn screen_all(cfg: &Config, probes: Vec<(Family, IpAddr)>) -> BTreeMap<Family, Vec<Alive>> {
     let timeout = cfg.timeout;
-    let url = format!("https://{host}/");
 
-    let results: Vec<Option<Alive>> = stream::iter(ips)
-        .map(|ip| {
-            let url = url.clone();
-            async move {
-                let c = pinned_client(host, ip, timeout).ok()?;
-                let f = fetch(&c, &url, 4_096, BROWSER_UA).await.ok()?;
-                Some(Alive {
+    let results: Vec<Option<(Family, Alive)>> = stream::iter(probes)
+        .map(|(fam, ip)| async move {
+            let host = fam.screen_host();
+            let url = format!("https://{host}/");
+            let c = pinned_client(host, ip, timeout).ok()?;
+            let f = fetch(&c, &url, 4_096, BROWSER_UA).await.ok()?;
+            Some((
+                fam,
+                Alive {
                     ip,
                     status: f.status,
                     ms: f.total_ms,
-                })
-            }
+                },
+            ))
         })
         .buffer_unordered(cfg.concurrency)
         .collect()
         .await;
 
-    let mut alive: Vec<Alive> = results.into_iter().flatten().collect();
-    alive.sort_by_key(|a| a.rank());
-    alive
+    let mut ranked: BTreeMap<Family, Vec<Alive>> = BTreeMap::new();
+    for (fam, alive) in results.into_iter().flatten() {
+        ranked.entry(fam).or_default().push(alive);
+    }
+    for v in ranked.values_mut() {
+        v.sort_by_key(|a| a.rank());
+    }
+    ranked
 }
 
 /// Stage 2: every target for this hostname must pass on this IP.
@@ -536,9 +555,16 @@ pub async fn run_cycle(cfg: &Config, cycle_id: u64, prev: Option<&Snapshot>) -> 
     }
 
     // ---- stage 1 ----
+    // Flatten every (family, candidate) pair into one stream: the per-family
+    // loop it replaces made the families' latencies additive.
+    let probes: Vec<(Family, IpAddr)> = pools
+        .iter()
+        .flat_map(|(fam, ips)| ips.iter().map(move |ip| (*fam, *ip)))
+        .collect();
+    let screened = screen_all(cfg, probes).await;
     let mut ranked: BTreeMap<Family, Vec<Alive>> = BTreeMap::new();
-    for (fam, pool) in pools {
-        let alive = screen(cfg, fam.screen_host(), pool).await;
+    for fam in pools.keys() {
+        let alive = screened.get(fam).cloned().unwrap_or_default();
         let ok200 = alive.iter().filter(|a| a.status == 200).count();
         tracing::info!(
             "family {:<6} reachable={} (200={})",
@@ -546,7 +572,7 @@ pub async fn run_cycle(cfg: &Config, cycle_id: u64, prev: Option<&Snapshot>) -> 
             alive.len(),
             ok200
         );
-        ranked.insert(fam, alive);
+        ranked.insert(*fam, alive);
     }
 
     // ---- stage 2 ----
@@ -555,15 +581,22 @@ pub async fn run_cycle(cfg: &Config, cycle_id: u64, prev: Option<&Snapshot>) -> 
     for t in all.iter().cloned() {
         by_host.entry(t.host).or_default().push(t);
     }
+    // Hosts whose family was suppressed by `FAMILIES` are never probed, so they
+    // must not be counted as verified -- and a suppressed *required* host must
+    // fail the cycle, otherwise `FAMILIES=raw` would report required_ok while
+    // github.com was never touched.
+    let mut suppressed: Vec<(&'static str, bool)> = Vec::new();
     for (host, targets) in by_host {
         let family = targets[0].family;
+        let required = targets.iter().any(|t| t.required);
         if !ranked.contains_key(&family) {
+            suppressed.push((host, required));
             continue;
         }
         jobs.push(Job {
             host,
             family,
-            required: targets.iter().any(|t| t.required),
+            required,
             targets,
         });
     }
@@ -583,6 +616,12 @@ pub async fn run_cycle(cfg: &Config, cycle_id: u64, prev: Option<&Snapshot>) -> 
     // connect timeout, and without a cap one host could stall the whole cycle.
     const WAVE: usize = 3;
     const HOST_BUDGET: std::time::Duration = std::time::Duration::from_secs(25);
+
+    // A job runs up to WAVE validations at once, so admitting `concurrency`
+    // jobs would put WAVE times that many requests on the wire. Divide instead:
+    // CONCURRENCY is documented as the request-level bound, and it should stay
+    // one, otherwise a 12 setting silently becomes 36 connects against GitHub.
+    let job_parallelism = (concurrency / WAVE).max(1);
 
     let outcomes: Vec<(&'static str, Option<Endpoint>, bool)> = stream::iter(jobs)
         .map(|job| {
@@ -653,7 +692,7 @@ pub async fn run_cycle(cfg: &Config, cycle_id: u64, prev: Option<&Snapshot>) -> 
                 (job.host, None, job.required)
             }
         })
-        .buffer_unordered(concurrency)
+        .buffer_unordered(job_parallelism)
         .collect()
         .await;
 
@@ -661,6 +700,13 @@ pub async fn run_cycle(cfg: &Config, cycle_id: u64, prev: Option<&Snapshot>) -> 
     let mut endpoints = Vec::new();
     let mut unverified = Vec::new();
     let mut required_ok = true;
+    for (host, required) in &suppressed {
+        if *required {
+            required_ok = false;
+        }
+        unverified.push(host.to_string());
+        tracing::warn!("{host} not probed: family disabled by FAMILIES");
+    }
     for (host, ep, required) in outcomes {
         match ep {
             Some(e) => endpoints.push(e),
@@ -738,40 +784,100 @@ pub async fn run_cycle(cfg: &Config, cycle_id: u64, prev: Option<&Snapshot>) -> 
     }
 }
 
-/// Guard against replacing a good snapshot with a degraded one.
-pub fn is_at_least_as_good(old: &Snapshot, new: &Snapshot) -> bool {
-    let (o, n) = (old.required_verified(), new.required_verified());
-    if n > o {
-        return true;
-    }
-    if n < o {
-        return false;
-    }
-    // same coverage: prefer the snapshot that also validated git
-    if new.git_ok != old.git_ok {
-        return new.git_ok;
-    }
-    true
+/// Publish order. Coverage of *required* hosts outranks total coverage: a
+/// cycle that verifies 12 optional hosts but loses `github.com` is worse than
+/// one that verifies 6, and a plain endpoint count cannot tell them apart.
+/// git is the last tiebreak because a block without a working `git` cannot be
+/// fetched from at all.
+fn rank(s: &Snapshot) -> (usize, usize, bool) {
+    (s.required_hits(), s.endpoints.len(), s.git_ok)
 }
 
-/// Probe one hostname directly -- used by `--once` diagnostics.
-#[allow(dead_code)]
-pub async fn probe_one(cfg: &Config, host: &'static str) -> Result<Option<Endpoint>> {
-    let all: Vec<Target> = targets().into_iter().filter(|t| t.host == host).collect();
-    if all.is_empty() {
-        anyhow::bail!("unknown host {host}");
-    }
-    let mut pool = resolve_v4(host).await;
-    for s in all[0].family.fallback() {
-        if let Ok(ip) = s.parse::<IpAddr>() {
-            pool.push(ip);
+/// Guard against replacing a good snapshot with a degraded one.
+pub fn is_at_least_as_good(old: &Snapshot, new: &Snapshot) -> bool {
+    rank(new) >= rank(old)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Local;
+
+    fn snap(hits: &[(&str, bool)], git: bool) -> Snapshot {
+        Snapshot {
+            generated_at: Local::now(),
+            cycle_id: 1,
+            verified: hits.len(),
+            expected: hits.len(),
+            required_ok: true,
+            git_ok: git,
+            git_detail: String::new(),
+            elapsed_ms: 0,
+            endpoints: hits
+                .iter()
+                .map(|(h, _)| Endpoint {
+                    host: (*h).to_string(),
+                    ip: "1.1.1.1".into(),
+                    latency_ms: 1.0,
+                    verified: true,
+                    detail: String::new(),
+                })
+                .collect(),
+            unverified: Vec::new(),
+            dns: BTreeMap::new(),
         }
     }
-    let alive = screen(cfg, host, pool).await;
-    for a in alive.iter().take(cfg.top_k) {
-        if let Some(ep) = validate_host(cfg, host, &all, a.ip).await {
-            return Ok(Some(ep));
-        }
+
+    #[test]
+    fn required_hosts_are_identified_from_targets() {
+        assert!(host_is_required("github.com"));
+        assert!(host_is_required("codeload.github.com"));
+        // Optional by design: a broken avatar must never block publication.
+        assert!(!host_is_required("avatars.githubusercontent.com"));
+        assert!(!host_is_required("gist.github.com"));
     }
-    Ok(None)
+
+    #[test]
+    fn losing_a_required_host_is_worse_than_gaining_optional_ones() {
+        // The regression this guards: 13 -> 33 verified but no github.com used
+        // to be accepted because only the raw count was compared.
+        let good = snap(&[("github.com", true), ("api.github.com", true)], true);
+        let wider = snap(
+            &[
+                ("api.github.com", true),
+                ("avatars.githubusercontent.com", true),
+                ("camo.githubusercontent.com", true),
+                ("media.githubusercontent.com", true),
+            ],
+            true,
+        );
+        assert!(
+            !is_at_least_as_good(&good, &wider),
+            "a block without github.com must not replace one that has it"
+        );
+    }
+
+    #[test]
+    fn more_required_coverage_is_accepted() {
+        let few = snap(&[("github.com", true)], true);
+        let more = snap(&[("github.com", true), ("api.github.com", true)], true);
+        assert!(is_at_least_as_good(&few, &more));
+        assert!(!is_at_least_as_good(&more, &few));
+    }
+
+    #[test]
+    fn equal_coverage_prefers_a_git_working_result() {
+        let git_broken = snap(&[("github.com", true)], false);
+        let git_ok = snap(&[("github.com", true)], true);
+        assert!(is_at_least_as_good(&git_broken, &git_ok));
+        assert!(!is_at_least_as_good(&git_ok, &git_broken));
+    }
+
+    #[test]
+    fn identical_cycles_are_idempotent() {
+        let a = snap(&[("github.com", true)], true);
+        let b = snap(&[("github.com", true)], true);
+        assert!(is_at_least_as_good(&a, &b));
+        assert!(is_at_least_as_good(&b, &a));
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "github-hosts"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Probe GitHub edge IPs and serve a verified hosts block over HTTP"

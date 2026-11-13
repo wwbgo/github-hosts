@@ -15,6 +15,11 @@ Dockerfile          text eol=lf
 .gitattributes      text eol=lf
 docker-compose.yml  text eol=lf
 
+# Batch files must stay CRLF: cmd.exe parses labels poorly with bare LF.
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+
 # Binaries, if any are ever added, must never be normalised.
 *.png binary
 *.jpg binary
